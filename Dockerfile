@@ -1,104 +1,169 @@
-# Base image
-FROM node:18-alpine3.18 AS base
+# ======================
+# Stage 1: Base OS Layer
+# ======================
+FROM debian:bookworm as base
 
-RUN apk update && apk upgrade
+ENV DEBIAN_FRONTEND=noninteractive
 
-FROM base AS ffmpeg
+RUN echo "deb http://deb.debian.org/debian bookworm main contrib non-free non-free-firmware" > /etc/apt/sources.list && \
+    apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends \
+        curl wget git gnupg2 ca-certificates && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# We build our own ffmpeg since 4.X is the only one supported
-ENV BIN="/usr/bin"
-RUN cd && \
-  apk add --no-cache --virtual .build-dependencies \
-  gnutls \
-  freetype-dev \
-  gnutls-dev \
-  lame-dev \
-  libass-dev \
-  libogg-dev \
-  libtheora-dev \
-  libvorbis-dev \ 
-  libvpx-dev \
-  libwebp-dev \ 
-  libssh2 \
-  opus-dev \
-  rtmpdump-dev \
-  x264-dev \
-  x265-dev \
-  yasm-dev \
-  build-base \ 
-  coreutils \ 
-  gnutls \ 
-  nasm \ 
-  dav1d-dev \
-  libbluray-dev \
-  libdrm-dev \
-  zimg-dev \
-  aom-dev \
-  xvidcore-dev \
-  fdk-aac-dev \
-  libva-dev \
-  git \
-  x264 && \
-  DIR=$(mktemp -d) && \
-  cd "${DIR}" && \
-  git clone --depth 1 --branch v4.4.1-4 https://github.com/jellyfin/jellyfin-ffmpeg.git && \
-  cd jellyfin-ffmpeg* && \
-  PATH="$BIN:$PATH" && \
-  ./configure --help && \
-  ./configure --bindir="$BIN" --disable-debug \
-  --prefix=/usr/lib/jellyfin-ffmpeg --extra-version=Jellyfin --disable-doc --disable-ffplay --disable-shared --disable-libxcb --disable-sdl2 --disable-xlib --enable-lto --enable-gpl --enable-version3 --enable-gmp --enable-gnutls --enable-libdrm --enable-libass --enable-libfreetype --enable-libfribidi --enable-libfontconfig --enable-libbluray --enable-libmp3lame --enable-libopus --enable-libtheora --enable-libvorbis --enable-libdav1d --enable-libwebp --enable-libvpx --enable-libx264 --enable-libx265  --enable-libzimg --enable-small --enable-nonfree --enable-libxvid --enable-libaom --enable-libfdk_aac --enable-vaapi --enable-hwaccel=h264_vaapi --toolchain=hardened && \
-  make -j4 && \
-  make install && \
-  make distclean && \
-  rm -rf "${DIR}"  && \
-  apk del --purge .build-dependencies
 
-#########################################################################
+# ===================================
+# Stage 2: Build Dependencies Layer
+# ===================================
+FROM base as build-deps
 
-# Builder image
-FROM base AS builder-web
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential yasm pkg-config nasm libtool autoconf automake cmake \
+        python3 python3-pip meson ninja-build \
+        libass-dev libfreetype6-dev libvorbis-dev libvpx-dev \
+        libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev libnuma-dev \
+        libopus-dev libx264-dev libx265-dev libdrm-dev libomxil-bellagio-dev \
+        libmp3lame-dev libtheora-dev libdav1d-dev \
+        git wget curl && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# ==================================
+# Stage 3: Intel iGPU Drivers Layer
+# ==================================
+FROM base as intel-drivers
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        intel-media-va-driver-non-free \
+        i965-va-driver \
+        intel-gpu-tools \
+        vainfo && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+
+# ================================
+# Stage 4: FFmpeg Compilation
+# ================================
+FROM build-deps as ffmpeg
+
+WORKDIR /build
+
+# 1. Additional Dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake libnuma-dev libtool m4 autoconf libva-dev and libdrm-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# 2. Build and install fdk-aac
+RUN git clone --depth 1 https://github.com/mstorsjo/fdk-aac.git && \
+    cd fdk-aac && \
+    autoreconf -fiv && \
+    ./configure --prefix=/usr/local && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig
+
+# 3. Build and install x265
+RUN git clone --branch stable --depth 1 https://bitbucket.org/multicoreware/x265_git && \
+    cd x265_git/build/linux && \
+    cmake -G "Unix Makefiles" -DCMAKE_INSTALL_PREFIX=/usr/local ../../source && \
+    make -j$(nproc) && \
+    make install
+
+# Clone and build ffmpeg
+WORKDIR /opt/ffmpeg
+
+RUN git clone --depth 1 --branch v4.4.1-4 https://github.com/jellyfin/jellyfin-ffmpeg/ . && \
+    ./configure --prefix=/usr \
+        --pkg-config-flags="--static" \
+        --extra-cflags="-I/usr/include" \
+        --extra-ldflags="-L/usr/lib" \
+        --extra-libs="-lpthread -lm" \
+        --bindir=/usr/bin \
+        --enable-gpl --enable-nonfree \
+        --enable-libx264 --enable-libx265 --enable-libvpx --enable-libopus \
+        --enable-libass --enable-libfreetype --enable-libmp3lame \
+        --enable-libvorbis --enable-libtheora --enable-libdav1d \
+        --enable-vaapi --enable-hwaccel=h264_vaapi \
+        --enable-hwaccel=hevc_vaapi && \
+    make -j"$(nproc)" && make install
+
+
+# ========================
+# Stage 5: Node Environment
+# ========================
+FROM node:18-bookworm as node-env
+
+# Install yarn classic
+RUN corepack enable && corepack prepare yarn@1.22.21 --activate
+
+# ========================
+# Stage 6: App Build Layer
+# ========================
+FROM node-env as builder
 
 WORKDIR /srv
-RUN apk add --no-cache git wget
 
 ARG BRANCH=development
-RUN REPO="https://github.com/Stremio/stremio-web.git"; if [ "$BRANCH" == "release" ];then git clone "$REPO" --depth 1 --branch $(git ls-remote --tags --refs $REPO | awk '{print $2}' | sort -V | tail -n1 | cut -d/ -f3); else git clone --depth 1 --branch "$BRANCH" https://github.com/Stremio/stremio-web.git; fi
+
+# Clone repo and patch localStorage
+RUN git clone --depth 1 --branch "$BRANCH" https://github.com/Stremio/stremio-web.git
 
 WORKDIR /srv/stremio-web
 
 COPY ./load_localStorage.js ./src/load_localStorage.js
 RUN sed -i "/entry: {/a \\        loader: './src/load_localStorage.js'," webpack.config.js
 
-RUN yarn install --no-audit --no-optional --mutex network --no-progress --ignore-scripts
-RUN yarn build
+RUN yarn install --no-audit --no-optional --mutex network --no-progress --ignore-scripts && \
+    yarn build
 
-RUN wget $(wget -O- https://raw.githubusercontent.com/Stremio/stremio-shell/master/server-url.txt) && wget -mkEpnp -nH "https://app.strem.io/" "https://app.strem.io/worker.js" "https://app.strem.io/images/stremio.png" "https://app.strem.io/images/empty.png" -P build/shell/ || true
+# Fetch stremio shell resources
+RUN wget $(wget -O- https://raw.githubusercontent.com/Stremio/stremio-shell/master/server-url.txt) && \
+    wget -mkEpnp -nH \
+        "https://app.strem.io/" \
+        "https://app.strem.io/worker.js" \
+        "https://app.strem.io/images/stremio.png" \
+        "https://app.strem.io/images/empty.png" \
+        -P build/shell/ || true
 
 
-##########################################################################
-
-# Main image
-FROM base AS final
-
-ARG VERSION=main
-LABEL org.opencontainers.image.source=https://github.com/tsaridas/stremio-docker
-LABEL org.opencontainers.image.description="Stremio Web Player and Server"
-LABEL org.opencontainers.image.licenses=MIT
-LABEL version=${VERSION}
+# ================================
+# Stage 7: Final Runtime Container
+# ================================
+FROM node-env as final
 
 WORKDIR /srv/stremio-server
-COPY --from=builder-web /srv/stremio-web/build ./build
-COPY --from=builder-web /srv/stremio-web/server.js ./
-RUN yarn global add http-server --no-audit --no-optional --mutex network --no-progress --ignore-scripts
 
+# Copy Intel GPU drivers
+COPY --from=intel-drivers /usr/lib/x86_64-linux-gnu/dri /usr/lib/x86_64-linux-gnu/dri
+COPY --from=intel-drivers /usr/bin/vainfo /usr/bin/vainfo
+
+# Copy compiled FFmpeg binaries
+COPY --from=ffmpeg /usr/lib /usr/lib
+COPY --from=ffmpeg /usr/bin/ffmpeg /usr/bin/ffmpeg
+COPY --from=ffmpeg /usr/bin/ffprobe /usr/bin/ffprobe
+
+# Copy all shared libs used by ffmpeg
+COPY --from=ffmpeg /usr/local/lib/libx265* /usr/lib/
+COPY --from=ffmpeg /usr/lib/x86_64-linux-gnu/libx264.so.* /usr/lib/x86_64-linux-gnu/
+COPY --from=ffmpeg /usr/lib/x86_64-linux-gnu/libvpx.so.*   /usr/lib/x86_64-linux-gnu/
+COPY --from=ffmpeg /usr/lib/x86_64-linux-gnu/libdav1d.so.* /usr/lib/x86_64-linux-gnu/
+COPY --from=ffmpeg /usr/lib/x86_64-linux-gnu/libxvidcore.so.* /usr/lib/x86_64-linux-gnu/
+
+# Copy additional
+COPY --from=ffmpeg /usr/lib/x86_64-linux-gnu/*.so* /usr/lib/x86_64-linux-gnu/
+
+# Copy frontend app build
+COPY --from=builder /srv/stremio-web/build ./build
+COPY --from=builder /srv/stremio-web/server.js ./
+
+# Custom scripts and config
 COPY ./stremio-web-service-run.sh ./
 COPY ./certificate.js ./
-RUN chmod +x stremio-web-service-run.sh
 COPY ./restart_if_idle.sh ./
-RUN chmod +x restart_if_idle.sh
-COPY localStorage.json ./
+COPY ./localStorage.json ./
 
+# Additional Config
 ENV FFMPEG_BIN=
 ENV FFPROBE_BIN=
 # default https://app.strem.io/shell-v4.4/
@@ -123,10 +188,10 @@ ENV HLSV2_REMOTE=
 # Custom application path for storing server settings, certificates, etc
 # You can change this but server.js always saves cache to /root/.stremio-server/
 ENV APP_PATH=
-ENV NO_CORS=
+ENV NO_CORS=1
 ENV CASTING_DISABLED=
 
-# Do not change the above ENVs. 
+# Do not change the above ENVs.
 
 # Set this to your lan or public ip.
 ENV IPADDRESS=
@@ -138,26 +203,18 @@ ENV CERT_FILE=
 # Server url
 ENV SERVER_URL=
 
-# Copy ffmpeg
-COPY --from=ffmpeg /usr/bin/ffmpeg /usr/bin/ffprobe /usr/bin/
-COPY --from=ffmpeg /usr/lib/jellyfin-ffmpeg /usr/lib/
+RUN chmod +x stremio-web-service-run.sh restart_if_idle.sh
 
-# Add libs
-RUN apk add --no-cache libwebp libvorbis x265-libs x264-libs libass opus libgmpxx lame-libs gnutls libvpx libtheora libdrm libbluray zimg libdav1d aom-libs xvidcore fdk-aac libva curl
+# Install HTTP server globally
+RUN npm install -g http-server
 
-# Add arch specific libs
-RUN if [ "$(uname -m)" = "x86_64" ]; then \
-  apk add --no-cache intel-media-driver mesa-va-gallium; \
-  fi
-
-# Clear cache
-RUN rm -rf /var/cache/apk/* && rm -rf /tmp/*
+ENV NODE_ENV=production
+ENV LIBVA_DRIVER_NAME=i965
+ENV DISPLAY=:0
+ENV LD_LIBRARY_PATH="/usr/lib:$LD_LIBRARY_PATH"
 
 VOLUME ["/root/.stremio-server"]
 
-# Expose default ports
 EXPOSE 8080 11470 12470
-
-ENTRYPOINT []
 
 CMD ["./stremio-web-service-run.sh"]
