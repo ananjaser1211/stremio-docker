@@ -1,13 +1,20 @@
 services:
   stremio:
-    image: tsaridas/stremio-docker:latest
+    build: .
+    container_name: stremio_server
     restart: unless-stopped
     environment:
-      NO_CORS: 1
-      #IPADDRESS: 192.168.1.10 # Setup your ip address here
+      - NO_CORS=1
+      - LIBVA_DRIVER_NAME=i965
+      - LIBVA_DRIVER_DEVICE=/dev/dri/renderD128  # Use i965 for your Intel Haswell GPU (renderD129)
+      - DISPLAY=
+      - PUID=1000
+      - PGID=1000
     ports:
-      - "8080:8080"
-      - "11470:11470" # Just one of the two should be enough
-      - "12470:12470"
+      - "8080:8080"      # Web UI port (if applicable)
+      - "11470:11470"    # Main Stremio server port
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128  # Map only your Intel iGPU render node (D129 is my nvdia GPU)
+      - /dev/dri/card1:/dev/dri/card1
     volumes:
-      - "/srv/config/stremio/:/root/.stremio-server" # set the first part to your local folder. Its not required though
+      - ~/stremio:/root/.stremio-server
