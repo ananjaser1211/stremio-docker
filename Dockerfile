@@ -25,7 +25,7 @@ RUN apt-get update && \
         libass-dev libfreetype6-dev libvorbis-dev libvpx-dev \
         libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev libnuma-dev \
         libopus-dev libx264-dev libx265-dev libdrm-dev libomxil-bellagio-dev \
-        libmp3lame-dev libtheora-dev libdav1d-dev \
+        libmp3lame-dev libtheora-dev libdav1d-dev libgnutls28-dev \
         git wget curl && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -75,12 +75,12 @@ WORKDIR /opt/ffmpeg
 
 RUN git clone --depth 1 --branch v4.4.1-4 https://github.com/jellyfin/jellyfin-ffmpeg/ . && \
     ./configure --prefix=/usr \
-        --pkg-config-flags="--static" \
         --extra-cflags="-I/usr/include" \
         --extra-ldflags="-L/usr/lib" \
         --extra-libs="-lpthread -lm" \
         --bindir=/usr/bin \
         --enable-gpl --enable-nonfree \
+        --enable-gnutls \
         --enable-libx264 --enable-libx265 --enable-libvpx --enable-libopus \
         --enable-libass --enable-libfreetype --enable-libmp3lame \
         --enable-libvorbis --enable-libtheora --enable-libdav1d \
@@ -92,7 +92,7 @@ RUN git clone --depth 1 --branch v4.4.1-4 https://github.com/jellyfin/jellyfin-f
 # ========================
 # Stage 5: Node Environment
 # ========================
-FROM node:18-bookworm as node-env
+FROM node:22-bookworm as node-env
 
 # Install yarn classic
 RUN corepack enable && corepack prepare yarn@1.22.21 --activate
