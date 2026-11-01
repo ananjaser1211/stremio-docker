@@ -114,8 +114,10 @@ WORKDIR /srv/stremio-web
 COPY ./load_localStorage.js ./src/load_localStorage.js
 RUN sed -i "/entry: {/a \\        loader: './src/load_localStorage.js'," webpack.config.js
 
-RUN yarn install --no-audit --no-optional --mutex network --no-progress --ignore-scripts && \
-    yarn build
+# stremio-web moved to pnpm (packageManager pnpm@11); same steps as upstream tsaridas/stremio-docker
+RUN npm install -g pnpm@11 --force && \
+    pnpm install --frozen-lockfile --reporter=silent && \
+    pnpm run build
 
 # Fetch stremio shell resources
 RUN wget $(wget -O- https://raw.githubusercontent.com/Stremio/stremio-shell/master/server-url.txt) && \
